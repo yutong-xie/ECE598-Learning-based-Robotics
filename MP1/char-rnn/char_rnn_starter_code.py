@@ -6,6 +6,8 @@ from tqdm import tqdm
 import torch
 from torch.utils import data
 from torch import nn, optim
+from torch.autograd import Variable
+
 
 DATASET_PATH = 'data/arXiv/'
 BATCH_SIZE = 32
@@ -16,9 +18,8 @@ char_to_index_dict = {c: i for i, c in enumerate(all_characters)}
 
 class PaperDataset(data.Dataset):
     """
-    Data loader for the arXiv Title and Abstracts Dataset. 
+    Data loader for the arXiv Title and Abstracts Dataset.
     """
-
     def __init__(self, device, split="train", chunk_len=200, data_dir=DATASET_PATH):
         assert (split in ["train", "val", "test"])
         file_path = os.path.join(data_dir, split + '.txt')
@@ -43,6 +44,7 @@ class PaperDataset(data.Dataset):
         num_chunks = num_valid_starts // self.chunk_len
         return num_chunks
 
+    # Guarantee that the outputs size is same for each data
     def __getitem__(self, index):
         index = index * self.chunk_len + self.offset
         inp = self.text_tensor[index:index + self.chunk_len]
@@ -53,32 +55,60 @@ class PaperDataset(data.Dataset):
 # We are providing a very simple network that looks at just the current token,
 # and tries to predict the next token.  As part of the assignment you will
 # develop a more expressive model to improve performance.
-class TwoGram(nn.Module):
-    def __init__(self, n_classes):
-        super(TwoGram, self).__init__()
-        self.layers = nn.Sequential(
-            nn.Embedding(n_classes, n_classes)
-        )
+class MyRNN(nn.Module):
+    def __init__(self, input_size, hidden_size, n_classes, num_layers=1, model="rnn"):
+        super(MyRNN, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.n_classes = n_classes
+        self.num_layers = num_layers
+        self.model = model
+        self.input2hidden  = nn.Embedding(input_size, hidden_size)
+        self.hidden2output = nn.Linear(hidden_size, n_classes)
 
-    def init_hidden(self, batch_size, device):
-        hidden = []
+        # rnn size: (input_size, hidden_size, num_layers)
+        if model == "rnn":
+            self.rnn = nn.RNN(hidden_size, hidden_size, num_layers)
+        elif model == "lstm":
+            self.rnn = nn.LSTM(hidden_size, hidden_size, num_layers)
+        elif model == "gru":
+            self.rnn = nn.GRU(hidden_size, hidden_size, num_layers)
+
+    def init_hidden(self, batch_size):
+        if self.model == "lstm":
+            hidden = (Variable(torch.zeros(self.num_layers, batch_size, self.hidden_size)),
+                    Variable(torch.zeros(self.num_layers, batch_size, self.hidden_size)))
+        else:
+            #(num_layers * num_directions, batch, hidden_size)
+            hidden = Variable(torch.zeros(self.num_layers, batch_size, self.hidden_size))
+
         return hidden
 
+    # input size should be [seq_len, batch_size, input_feature]
     def forward(self, inp, hidden):
-        x = self.layers(inp)
-        return x, hidden
+        length = inp.shape[1]
+        batch_size = inp.shape[0]
+        inp = self.input2hidden(inp)    #(200, 32, 100)
+        # self.rnn(input,hidden)
+        # input size: (seq_len, batch, input_size)
+        # hidden size: (num_layers * num_directions, batch_size, hidden_size)
+        output, hidden = self.rnn(inp.view(length, batch_size, -1), hidden)    #ouput:(200, 32, 100)
+        output = self.hidden2output(output.view(batch_size,length, -1))
+
+        return output, hidden
 
 
+# generate sample sentences and save to file
 def generate_abstract(model, device, file_name, temperature=0.8):
     # get list of titles from test set
     text = unidecode.unidecode(open(os.path.join(DATASET_PATH, "test.txt")).read())
     titles = [line for line in text.split("\n") if line[:6] == "Title:"]
-    
+
     # get random indices for pulling titles from test set
     rng = np.random.RandomState(111)
     indices = [i for i in range(len(titles))]
     rng.shuffle(indices)
-    
+
     # title prompts for generating abstracts
     prompts = [titles[indices[i]] + "\nAbstract: " for i in range(16)]
     abstracts = [evaluate(model, device, prime_str=prompt, predict_len=None, temperature=temperature)
@@ -157,7 +187,8 @@ def simple_val(model, imset, device):
     criterion = nn.CrossEntropyLoss(reduction='mean')
     total_loss = []
     for i, batch in enumerate(val_dataloader):
-        hidden = model.init_hidden(1, device)
+        hidden = model.init_hidden(1)
+
         inp, gt = batch
         pred, hidden = model(inp, hidden)
         pred = pred.permute(0, 2, 1)
@@ -174,7 +205,9 @@ def simple_val(model, imset, device):
 def simple_train(device):
     # Initializing a simple model.
     train_dataset = PaperDataset(device, split='train')
-    model = TwoGram(len(train_dataset.classes))
+
+    # MyRNN(input_size, hidden_size, n_classes, num_layers, model="rnn")
+    model = MyRNN(100,100,len(train_dataset.classes),model="lstm")
 
     # Moving the model to the device (eg GPU) used for training.
     model = model.to(device)
@@ -203,14 +236,16 @@ def simple_train(device):
             # Zero out gradient blobs in the optimizer
             optimizer.zero_grad()
 
-            hidden = model.init_hidden(BATCH_SIZE, device)
-            inp, gt = batch
+            hidden = model.init_hidden(BATCH_SIZE)
 
+            #inp = (32, 200)
+            inp, gt = batch
             # Get model predictions
             pred, hidden = model(inp, hidden)
 
             # Compute loss against gt
             pred = pred.permute(0, 2, 1)
+
             loss = criterion(pred, gt)
 
             # Compute gradients with respect to loss
