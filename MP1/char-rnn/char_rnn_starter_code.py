@@ -10,7 +10,7 @@ from torch.autograd import Variable
 
 
 DATASET_PATH = 'data/arXiv/'
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 
 all_characters = string.printable
 char_to_index_dict = {c: i for i, c in enumerate(all_characters)}
@@ -68,19 +68,20 @@ class MyRNN(nn.Module):
 
         # rnn size: (input_size, hidden_size, num_layers)
         if model == "rnn":
+            # self.rnn = nn.RNN(input_size, hidden_size, num_layers)
             self.rnn = nn.RNN(hidden_size, hidden_size, num_layers)
         elif model == "lstm":
             self.rnn = nn.LSTM(hidden_size, hidden_size, num_layers)
         elif model == "gru":
             self.rnn = nn.GRU(hidden_size, hidden_size, num_layers)
 
-    def init_hidden(self, batch_size):
+    def init_hidden(self, batch_size, device):
         if self.model == "lstm":
-            hidden = (Variable(torch.zeros(self.num_layers, batch_size, self.hidden_size)),
-                    Variable(torch.zeros(self.num_layers, batch_size, self.hidden_size)))
+            hidden = (Variable(torch.zeros(self.num_layers, batch_size, self.hidden_size).to(device)),
+                    Variable(torch.zeros(self.num_layers, batch_size, self.hidden_size)).to(device))
         else:
             #(num_layers * num_directions, batch, hidden_size)
-            hidden = Variable(torch.zeros(self.num_layers, batch_size, self.hidden_size))
+            hidden = Variable(torch.zeros(self.num_layers, batch_size, self.hidden_size)).to(device)
 
         return hidden
 
@@ -88,12 +89,13 @@ class MyRNN(nn.Module):
     def forward(self, inp, hidden):
         length = inp.shape[1]
         batch_size = inp.shape[0]
-        inp = self.input2hidden(inp)    #(200, 32, 100)
+        embedding = self.input2hidden(inp)    #(200, 32, 100)
         # self.rnn(input,hidden)
         # input size: (seq_len, batch, input_size)
         # hidden size: (num_layers * num_directions, batch_size, hidden_size)
-        output, hidden = self.rnn(inp.view(length, batch_size, -1), hidden)    #ouput:(200, 32, 100)
+        output, hidden = self.rnn(embedding.view(length, batch_size, -1), hidden)    #ouput:(200, 32, hidden_size)
         output = self.hidden2output(output.view(batch_size,length, -1))
+
 
         return output, hidden
 
@@ -187,7 +189,7 @@ def simple_val(model, imset, device):
     criterion = nn.CrossEntropyLoss(reduction='mean')
     total_loss = []
     for i, batch in enumerate(val_dataloader):
-        hidden = model.init_hidden(1)
+        hidden = model.init_hidden(1, device)
 
         inp, gt = batch
         pred, hidden = model(inp, hidden)
@@ -206,8 +208,14 @@ def simple_train(device):
     # Initializing a simple model.
     train_dataset = PaperDataset(device, split='train')
 
+    input_size = 100
+    hidden_size = 20
+    n_classes = len(train_dataset.classes)
+    num_layers = 2
+    model = "rnn"
+
     # MyRNN(input_size, hidden_size, n_classes, num_layers, model="rnn")
-    model = MyRNN(100,100,len(train_dataset.classes),model="lstm")
+    model = MyRNN(input_size, hidden_size,n_classes, num_layers, model)
 
     # Moving the model to the device (eg GPU) used for training.
     model = model.to(device)
@@ -220,7 +228,7 @@ def simple_train(device):
 
     # Optimizer that we will be using, along with the learning rate. Feel free
     # to experiment with a different learning rate, optimizer.
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
 
     iteration = 0
 
@@ -236,12 +244,13 @@ def simple_train(device):
             # Zero out gradient blobs in the optimizer
             optimizer.zero_grad()
 
-            hidden = model.init_hidden(BATCH_SIZE)
+            hidden = model.init_hidden(BATCH_SIZE, device)
 
             #inp = (32, 200)
             inp, gt = batch
+            # print("inp size:", inp.shape)
             # Get model predictions
-            pred, hidden = model(inp, hidden)
+            pred, hidden = model(inp, hidden)   # pred: (32, 200, 100)
 
             # Compute loss against gt
             pred = pred.permute(0, 2, 1)
@@ -259,7 +268,7 @@ def simple_train(device):
             training_loss += [l]
 
         # Every few epochs print the loss.
-        if np.mod(j + 1, 20) == 0:
+        if np.mod(j + 1, 10) == 0:
             print('Loss [{:8d}]: {:5.4f}'.format(iteration, np.mean(training_loss)))
 
         # Every few epochs get metrics on the validation set.
